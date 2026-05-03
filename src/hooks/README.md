@@ -6,7 +6,7 @@
 
 The **lifecycle management** layer for LLM agent hooks: install, uninstall, verify integrity, audit usage, and manage trust. This component creates and maintains the hook artifacts that live in `hooks/` (root), but does **not** execute rewrite logic itself — that lives in `discover/registry`.
 
-Owns: `rtk init` installation flows (4 agents via `AgentTarget` enum + 3 special modes: Gemini, Codex, OpenCode), SHA-256 integrity verification, hook version checking, audit log analysis, `rtk rewrite` CLI entry point, and TOML filter trust management.
+Owns: `rtk init` installation flows (4 agents via `AgentTarget` enum + 4 special modes: Gemini, Codex, OpenCode, CodeBuddy), SHA-256 integrity verification, hook version checking, audit log analysis, `rtk rewrite` CLI entry point, and TOML filter trust management.
 
 Does **not** own: the deployed hook scripts themselves (that's `hooks/`), the rewrite pattern registry (that's `discover/`), or command filtering (that's `cmds/`).
 
@@ -19,7 +19,7 @@ LLM agent integration layer that installs, validates, and executes command-rewri
 
 ## Installation Modes
 
-`rtk init` supports 6 distinct installation flows:
+`rtk init` supports 7 distinct installation flows:
 
 | Mode | Command | Creates | Patches |
 |------|---------|---------|---------|
@@ -30,6 +30,8 @@ LLM agent integration layer that installs, validates, and executes command-rewri
 | Cline | `rtk init --agent cline` | `.clinerules` | -- |
 | Codex | `rtk init --codex` | RTK.md in `$CODEX_HOME` or `~/.codex` | AGENTS.md |
 | Cursor | `rtk init -g --agent cursor` | Cursor hook | hooks.json |
+| CodeBuddy (global) | `rtk init -g --codebuddy` | settings.json + instructions | `~/.codebuddy/` |
+| CodeBuddy (local) | `rtk init --codebuddy` | settings.json + instructions | `.codebuddy/` |
 
 
 ## Integrity Verification

@@ -371,6 +371,10 @@ enum Commands {
         /// Install GitHub Copilot integration (VS Code + CLI)
         #[arg(long)]
         copilot: bool,
+
+        /// Install CodeBuddy integration
+        #[arg(long)]
+        codebuddy: bool,
     },
 
     /// Download with compact output (strips progress bars)
@@ -759,6 +763,8 @@ enum HookCommands {
     Gemini,
     /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
     Copilot,
+    /// Process CodeBuddy hook (reads JSON from stdin)
+    Codebuddy,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1756,6 +1762,7 @@ fn run_cli() -> Result<i32> {
             uninstall,
             codex,
             copilot,
+            codebuddy,
         } => {
             if show {
                 hooks::init::show_config(codex)?;
@@ -1773,6 +1780,15 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
             } else if copilot {
                 hooks::init::run_copilot(cli.verbose)?;
+            } else if codebuddy {
+                let patch_mode = if auto_patch {
+                    hooks::init::PatchMode::Auto
+                } else if no_patch {
+                    hooks::init::PatchMode::Skip
+                } else {
+                    hooks::init::PatchMode::Ask
+                };
+                hooks::init::run_codebuddy(global, hook_only, patch_mode, cli.verbose)?;
             } else if agent == Some(AgentTarget::Kilocode) {
                 if global {
                     anyhow::bail!("Kilo Code is project-scoped. Use: rtk init --agent kilocode");
@@ -2114,6 +2130,10 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Copilot => {
                 hooks::hook_cmd::run_copilot()?;
+                0
+            }
+            HookCommands::Codebuddy => {
+                hooks::hook_cmd::run_codebuddy()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {
