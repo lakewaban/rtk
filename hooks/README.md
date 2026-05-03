@@ -40,6 +40,7 @@ Each agent subdirectory has its own README with hook-specific details:
 - **[`windsurf/`](windsurf/README.md)** — Rules file (prompt-level), `.windsurfrules` workspace-scoped
 - **[`codex/`](codex/README.md)** — Awareness document, `AGENTS.md` integration, `$CODEX_HOME` or `~/.codex/` location
 - **[`opencode/`](opencode/README.md)** — TypeScript plugin, `zx` library, `tool.execute.before` event, in-place mutation
+- **[`codebuddy/`](codebuddy/README.md)** — Rust binary hook, `PreToolUse` event, `modifiedInput` format, `continue` field
 
 ## Supported Agents
 
@@ -54,6 +55,7 @@ Each agent subdirectory has its own README with hook-specific details:
 | Windsurf | Custom instructions (rules file) | Prompt-level guidance | N/A |
 | Codex CLI | AGENTS.md / instructions | Prompt-level guidance | N/A |
 | OpenCode | TypeScript plugin (`tool.execute.before`) | In-place mutation | Yes |
+| CodeBuddy | Rust binary (`rtk hook codebuddy`) | Transparent rewrite | Yes (`modifiedInput`) |
 
 ## JSON Formats by Agent
 
@@ -156,6 +158,34 @@ if (rewritten && rewritten !== command) {
 }
 ```
 
+### CodeBuddy (Rust Binary)
+
+**Input** (stdin):
+```json
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "git status" }
+}
+```
+
+**Output** (when rewritten):
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "permissionDecisionReason": "RTK auto-rewrite",
+    "modifiedInput": { "command": "rtk git status" }
+  }
+}
+```
+
+**No rewrite**: `{"continue":true}`
+
+Uses `modifiedInput` (not `updatedInput`) to preserve all fields in `tool_input`.
+
 ## Command Rewrite Registry
 
 The registry (`src/discover/registry.rs`) handles command patterns across these categories:
@@ -216,7 +246,7 @@ New integrations must follow the [Exit Code Contract](#exit-code-contract) and [
 
 | Tier | Mechanism | Maintenance | Examples |
 |------|-----------|-------------|----------|
-| **Full hook** | Shell script or Rust binary, intercepts commands via agent's hook API | High — must track agent API changes | Claude Code, Cursor, Copilot, Gemini |
+| **Full hook** | Shell script or Rust binary, intercepts commands via agent's hook API | High — must track agent API changes | Claude Code, Cursor, Copilot, Gemini, CodeBuddy |
 | **Plugin** | TypeScript/JS plugin in agent's plugin system | Medium — agent manages loading | OpenCode |
 | **Rules file** | Prompt-level instructions the agent reads | Low — no code to break | Cline, Windsurf, Codex |
 

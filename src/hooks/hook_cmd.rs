@@ -459,6 +459,101 @@ pub fn run_cursor() -> Result<()> {
     Ok(())
 }
 
+// ── CodeBuddy payload processor ─────────────────────────────
+
+/// Process CodeBuddy hook payload and return output JSON.
+/// Returns Some(output_json) if handled, None if input is invalid.
+fn process_codebuddy_payload(v: &Value) -> Option<String> {
+    // Check hook_event_name, only process PreToolUse
+    let event_name = v
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if event_name != "PreToolUse" {
+        // Not PreToolUse, pass through with continue: true
+        return Some(r#"{"continue":true}"#.to_string());
+    }
+
+    // Check tool_name
+    let tool_name = v.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+
+    if tool_name != "Bash" && tool_name != "execute_command" {
+        // Not a Bash command, pass through
+        return Some(r#"{"continue":true}"#.to_string());
+    }
+
+    // Extract command from tool_input.command
+    let cmd = match v
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+    {
+        Some(c) => c.to_string(),
+        None => return Some(r#"{"continue":true}"#.to_string()),
+    };
+
+    // Check permissions
+    let verdict = permissions::check_command(&cmd);
+
+    if verdict == PermissionVerdict::Deny {
+        audit_log("deny", &cmd, "");
+        let output = json!({
+            "continue": false,
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Blocked by RTK permission rule"
+            }
+        });
+        return Some(output.to_string());
+    }
+
+    // Try to rewrite
+    let rewritten = match get_rewritten(&cmd) {
+        Some(r) => r,
+        None => return Some(r#"{"continue":true}"#.to_string()),
+    };
+
+    audit_log("rewrite", &cmd, &rewritten);
+
+    // Build updatedInput - preserve all fields in tool_input
+    // Note: CodeBuddy uses "updatedInput" (not "modifiedInput" as per docs)
+    let mut updated_input = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+    if let Some(obj) = updated_input.as_object_mut() {
+        obj.insert("command".into(), Value::String(rewritten));
+    }
+
+    // Determine permission decision
+    let decision = match verdict {
+        PermissionVerdict::Allow => "allow",
+        _ => "ask",
+    };
+
+    // Output in CodeBuddy format
+    // CodeBuddy reads hookSpecificOutput.updatedInput (not modifiedInput)
+    let output = json!({
+        "continue": true,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": "RTK auto-rewrite",
+            "updatedInput": updated_input
+        }
+    });
+
+    Some(output.to_string())
+}
+
+#[cfg(test)]
+fn run_codebuddy_inner(input: &str) -> String {
+    let v: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(_) => return "{}".to_string(),
+    };
+    process_codebuddy_payload(&v).unwrap_or_else(|| "{}".to_string())
+}
+
 #[cfg(test)]
 fn run_cursor_inner(input: &str) -> String {
     run_cursor_inner_with_rules(input, &[], &[], &[])
@@ -808,6 +903,160 @@ mod tests {
         assert_eq!(v["permission"], "ask");
     }
 
+    // --- CodeBuddy handler ---
+
+    fn codebuddy_input(cmd: &str) -> String {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": cmd }
+        })
+        .to_string()
+    }
+
+    fn codebuddy_input_with_fields(cmd: &str, timeout: u64, description: &str) -> String {
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": cmd,
+                "timeout": timeout,
+                "description": description
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_codebuddy_rewrite_basic() {
+        let input = codebuddy_input("git status");
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["continue"], true);
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"]["command"],
+            "rtk git status"
+        );
+    }
+
+    #[test]
+    fn test_codebuddy_no_rewrite_for_rtk_prefixed() {
+        let input = codebuddy_input("rtk git status");
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // Already has rtk prefix, should pass through with continue: true
+        assert_eq!(v["continue"], true);
+        assert!(v["hookSpecificOutput"].is_null());
+    }
+
+    #[test]
+    fn test_codebuddy_malformed_json_passthrough() {
+        let input = "{invalid json";
+        let result = run_codebuddy_inner(input);
+        // Malformed JSON returns "{}"
+        assert_eq!(result, "{}");
+    }
+
+    #[test]
+    fn test_codebuddy_no_tool_input_passthrough() {
+        let input = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"}).to_string();
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // No tool_input, should pass through with continue: true
+        assert_eq!(v["continue"], true);
+    }
+
+    #[test]
+    fn test_codebuddy_heredoc_passthrough() {
+        let input = codebuddy_input("cat <<EOF\nhello\nEOF");
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        // Heredoc commands should not be rewritten (no rewrite available)
+        assert_eq!(v["continue"], true);
+        assert!(v["hookSpecificOutput"].is_null());
+    }
+
+    #[test]
+    fn test_codebuddy_unicode_null_passthrough() {
+        let input = codebuddy_input(&format!("git status \u{0000}\u{FEFF}"));
+        let _ = run_codebuddy_inner(&input);
+        // Should not panic
+    }
+
+    #[test]
+    fn test_codebuddy_extremely_long_command() {
+        let long_cmd = format!("git status {}", "A".repeat(100_000));
+        let input = codebuddy_input(&long_cmd);
+        let _ = run_codebuddy_inner(&input);
+        // Should not panic
+    }
+
+    #[test]
+    fn test_codebuddy_rewrite_preserves_tool_input_fields() {
+        let input = codebuddy_input_with_fields("git status", 30000, "Check repo status");
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        let modified = &v["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(modified["command"], "rtk git status");
+        assert_eq!(modified["timeout"], 30000);
+        assert_eq!(modified["description"], "Check repo status");
+    }
+
+    #[test]
+    fn test_codebuddy_passthrough_no_output() {
+        // Commands that don't need rewrite return {"continue":true}
+        let input = codebuddy_input("htop");
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["continue"], true);
+        assert!(v["hookSpecificOutput"].is_null());
+    }
+
+    #[test]
+    fn test_codebuddy_empty_command_passthrough() {
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "" }
+        })
+        .to_string();
+        let result = run_codebuddy_inner(&input);
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["continue"], true);
+    }
+
+    #[test]
+    fn test_codebuddy_env_prefix_preserved() {
+        let result = run_codebuddy_inner(&codebuddy_input("GIT_PAGER=cat git status"));
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"]["command"],
+            "GIT_PAGER=cat rtk git status"
+        );
+    }
+
+    #[test]
+    fn test_codebuddy_compound_command() {
+        let result = run_codebuddy_inner(&codebuddy_input("git add . && cargo test"));
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            v["hookSpecificOutput"]["updatedInput"]["command"],
+            "rtk git add . && rtk cargo test"
+        );
+    }
+
+    #[test]
+    fn test_codebuddy_json_output_structure() {
+        let result = run_codebuddy_inner(&codebuddy_input("git status"));
+        let v: Value = serde_json::from_str(&result).unwrap();
+        let hook = &v["hookSpecificOutput"];
+
+        assert_eq!(hook["hookEventName"], "PreToolUse");
+        assert_eq!(hook["permissionDecisionReason"], "RTK auto-rewrite");
+        assert!(hook["updatedInput"].is_object());
+        assert!(hook["updatedInput"]["command"].is_string());
+    }
+
     // --- Audit logging ---
 
     #[test]
@@ -905,4 +1154,48 @@ mod tests {
             "cargo test should be rewritable when not denied"
         );
     }
+}
+
+/// Run the CodeBuddy hook.
+pub fn run_codebuddy() -> Result<()> {
+    let debug = std::env::var("RTK_DEBUG").is_ok();
+    let input = read_stdin_limited()?;
+
+    if debug {
+        eprintln!(
+            "[rtk/hook/codebuddy] Received input (first 500 chars): {}",
+            &input[..std::cmp::min(500, input.len())]
+        );
+    }
+
+    let input = input.trim();
+    if input.is_empty() {
+        if debug {
+            eprintln!("[rtk/hook/codebuddy] Empty input, exiting");
+        }
+        return Ok(());
+    }
+
+    let v: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            return Ok(());
+        }
+    };
+
+    if debug {
+        eprintln!(
+            "[rtk/hook/codebuddy] Event: {}",
+            v.get("hook_event_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        );
+    }
+
+    if let Some(output) = process_codebuddy_payload(&v) {
+        let _ = writeln!(io::stdout(), "{output}");
+    }
+
+    Ok(())
 }

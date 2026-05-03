@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use super::constants::{
-    BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND,
-    GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEBUDDY_HOOK_COMMAND, CODEX_DIR,
+    CURSOR_HOOK_COMMAND, GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY,
+    REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 
@@ -2304,6 +2305,8 @@ fn show_claude_config() -> Result<()> {
     println!("  rtk init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
     println!("  rtk init -g --opencode      # OpenCode plugin only");
     println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks");
+    println!("  rtk init -g --codebuddy     # Install CodeBuddy hooks (global ~/.codebuddy/)");
+    println!("  rtk init --codebuddy        # Install CodeBuddy hooks (project-local .codebuddy/)");
 
     Ok(())
 }
@@ -2667,10 +2670,306 @@ pub fn run_copilot(verbose: u8) -> Result<()> {
     Ok(())
 }
 
+// ── CodeBuddy integration ─────────────────────────────
+
+const CODEBUDDY_HOOK_JSON: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "rtk hook codebuddy",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+
+const CODEBUDDY_INSTRUCTIONS: &str = r#"# RTK — Token-Optimized CLI
+
+**RTK** is a CLI proxy that filters and compresses command outputs, saving 60-90% tokens.
+
+## Rule
+
+Always prefix shell commands with `rtk`:
+
+```bash
+# Instead of:              Use:
+git status                 rtk git status
+git log -10                rtk git log -10
+cargo test                 rtk cargo test
+docker ps                  rtk docker ps
+kubectl get pods           rtk kubectl pods
+```
+
+## Meta commands (use directly)
+
+```bash
+rtk gain              # Token savings dashboard
+rtk gain --history    # Per-command savings history
+rtk discover          # Find missed rtk opportunities
+rtk proxy <cmd>       # Run raw (no filtering) but track usage
+```
+"#;
+
+/// Entry point for `rtk init --codebuddy`
+pub fn run_codebuddy(
+    global: bool,
+    hook_only: bool,
+    patch_mode: PatchMode,
+    verbose: u8,
+) -> Result<()> {
+    // Determine config directory
+    let config_dir = if global {
+        // Global: ~/.codebuddy/
+        dirs::home_dir()
+            .map(|h| h.join(".codebuddy"))
+            .context("Cannot find home directory")?
+    } else {
+        // Project-local: <project>/.codebuddy/
+        PathBuf::from(".codebuddy")
+    };
+
+    fs::create_dir_all(&config_dir)
+        .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+
+    // 1. Patch hook config (merge into existing settings.json, don't overwrite)
+    let hook_path = config_dir.join("settings.json");
+    patch_codebuddy_settings_json(&hook_path, patch_mode, verbose)?;
+
+    // 2. Write instructions (unless hook-only mode)
+    if !hook_only {
+        let instructions_path = config_dir.join("CODEBUDDY_INSTRUCTIONS.md");
+        write_if_changed(
+            &instructions_path,
+            CODEBUDDY_INSTRUCTIONS,
+            "CodeBuddy instructions",
+            verbose,
+        )?;
+    }
+
+    println!(
+        "\nCodeBuddy integration installed ({}).\n",
+        if global { "global" } else { "project-local" }
+    );
+    println!("  Hook config:   {}", hook_path.display());
+    if !hook_only {
+        println!(
+            "  Instructions:  {}",
+            config_dir.join("CODEBUDDY_INSTRUCTIONS.md").display()
+        );
+    }
+    println!("\n  Restart CodeBuddy to activate.\n");
+
+    Ok(())
+}
+
+/// Patch (merge) RTK hook entry into CodeBuddy settings.json.
+/// Reads the existing file, checks idempotency, and adds only the missing entry.
+/// Never discards existing content.
+fn patch_codebuddy_settings_json(path: &Path, mode: PatchMode, verbose: u8) -> Result<()> {
+    // Read or bootstrap
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // Idempotency check
+    if codebuddy_hook_already_present(&root) {
+        if verbose > 0 {
+            eprintln!("CodeBuddy settings.json: RTK hook already present");
+        }
+        return Ok(());
+    }
+
+    // Respect PatchMode
+    match mode {
+        PatchMode::Skip => {
+            println!(
+                "\n  [manual] Add to {}:\n{}",
+                path.display(),
+                CODEBUDDY_HOOK_JSON
+            );
+            return Ok(());
+        }
+        PatchMode::Ask => {
+            if !prompt_user_consent(path)? {
+                println!(
+                    "\n  [manual] Add to {}:\n{}",
+                    path.display(),
+                    CODEBUDDY_HOOK_JSON
+                );
+                return Ok(());
+            }
+        }
+        PatchMode::Auto => {}
+    }
+
+    // Merge hook entry
+    insert_codebuddy_hook_entry(&mut root)?;
+
+    // Backup original if it exists
+    if path.exists() {
+        let backup_path = path.with_extension("json.bak");
+        fs::copy(path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup_path.display());
+        }
+    }
+
+    // Atomic write
+    let serialized =
+        serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+    atomic_write(path, &serialized)?;
+
+    println!("  settings.json: hook added ({})", path.display());
+    Ok(())
+}
+
+/// Check if RTK hook is already present in CodeBuddy settings.json
+fn codebuddy_hook_already_present(root: &serde_json::Value) -> bool {
+    let pre_tool_use = match root
+        .get("hooks")
+        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
+        .and_then(|p| p.as_array())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    pre_tool_use
+        .iter()
+        .filter_map(|entry| entry.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|hook| hook.get("command")?.as_str())
+        .any(|cmd| cmd == CODEBUDDY_HOOK_COMMAND)
+}
+
+/// Merge RTK PreToolUse hook entry into CodeBuddy settings.json root value.
+/// Preserves all existing hooks.PreToolUse entries.
+fn insert_codebuddy_hook_entry(root: &mut serde_json::Value) -> Result<()> {
+    let root_obj = match root.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            *root = serde_json::json!({});
+            root.as_object_mut().expect("just-created json object")
+        }
+    };
+
+    let hooks = root_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("hooks value is not an object")?;
+
+    let pre_tool_use = hooks
+        .entry(PRE_TOOL_USE_KEY)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .context("PreToolUse value is not an array")?;
+
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "command",
+            "command": CODEBUDDY_HOOK_COMMAND,
+            "timeout": 10
+        }]
+    }));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ── CodeBuddy patch tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_codebuddy_patch_creates_new_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_codebuddy_settings_json(&path, PatchMode::Auto, 0).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            codebuddy_hook_already_present(&v),
+            "Hook should be present after patch"
+        );
+    }
+
+    #[test]
+    fn test_codebuddy_patch_merges_into_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Pre-existing settings with unrelated content
+        let existing = serde_json::json!({
+            "someOtherKey": true,
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Write", "hooks": [{"type": "command", "command": "echo write"}]}
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        patch_codebuddy_settings_json(&path, PatchMode::Auto, 0).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // RTK hook was added
+        assert!(
+            codebuddy_hook_already_present(&v),
+            "RTK hook should be present"
+        );
+
+        // Original content preserved
+        assert_eq!(v["someOtherKey"], serde_json::json!(true));
+        let entries = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "Should have 2 PreToolUse entries");
+    }
+
+    #[test]
+    fn test_codebuddy_patch_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_codebuddy_settings_json(&path, PatchMode::Auto, 0).unwrap();
+        patch_codebuddy_settings_json(&path, PatchMode::Auto, 0).unwrap(); // second call
+
+        let content = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entries = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "Should not duplicate hook on second run");
+    }
+
+    #[test]
+    fn test_codebuddy_patch_skip_mode_does_not_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_codebuddy_settings_json(&path, PatchMode::Skip, 0).unwrap();
+
+        assert!(!path.exists(), "Skip mode should not create the file");
+    }
 
     #[test]
     fn test_init_mentions_all_top_level_commands() {
