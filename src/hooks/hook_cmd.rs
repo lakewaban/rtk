@@ -531,14 +531,16 @@ fn process_codebuddy_payload(v: &Value) -> Option<String> {
     };
 
     // Output in CodeBuddy format
-    // CodeBuddy reads hookSpecificOutput.updatedInput (not modifiedInput)
+    // - updatedInput: for CodeBuddy Code (VS Code extension)
+    // - modifiedInput: for CodeBuddy IDE (standalone IDE)
     let output = json!({
         "continue": true,
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": decision,
             "permissionDecisionReason": "RTK auto-rewrite",
-            "updatedInput": updated_input
+            "updatedInput": updated_input,
+            "modifiedInput": updated_input
         }
     });
 
@@ -933,8 +935,13 @@ mod tests {
         let result = run_codebuddy_inner(&input);
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
+        // Check both updatedInput (for CodeBuddy Code) and modifiedInput (for CodeBuddy IDE)
         assert_eq!(
             v["hookSpecificOutput"]["updatedInput"]["command"],
+            "rtk git status"
+        );
+        assert_eq!(
+            v["hookSpecificOutput"]["modifiedInput"]["command"],
             "rtk git status"
         );
     }
@@ -996,7 +1003,12 @@ mod tests {
         let input = codebuddy_input_with_fields("git status", 30000, "Check repo status");
         let result = run_codebuddy_inner(&input);
         let v: Value = serde_json::from_str(&result).unwrap();
-        let modified = &v["hookSpecificOutput"]["updatedInput"];
+        // Check both updatedInput and modifiedInput
+        let updated = &v["hookSpecificOutput"]["updatedInput"];
+        let modified = &v["hookSpecificOutput"]["modifiedInput"];
+        assert_eq!(updated["command"], "rtk git status");
+        assert_eq!(updated["timeout"], 30000);
+        assert_eq!(updated["description"], "Check repo status");
         assert_eq!(modified["command"], "rtk git status");
         assert_eq!(modified["timeout"], 30000);
         assert_eq!(modified["description"], "Check repo status");
@@ -1029,8 +1041,13 @@ mod tests {
     fn test_codebuddy_env_prefix_preserved() {
         let result = run_codebuddy_inner(&codebuddy_input("GIT_PAGER=cat git status"));
         let v: Value = serde_json::from_str(&result).unwrap();
+        // Check both updatedInput and modifiedInput
         assert_eq!(
             v["hookSpecificOutput"]["updatedInput"]["command"],
+            "GIT_PAGER=cat rtk git status"
+        );
+        assert_eq!(
+            v["hookSpecificOutput"]["modifiedInput"]["command"],
             "GIT_PAGER=cat rtk git status"
         );
     }
@@ -1039,8 +1056,13 @@ mod tests {
     fn test_codebuddy_compound_command() {
         let result = run_codebuddy_inner(&codebuddy_input("git add . && cargo test"));
         let v: Value = serde_json::from_str(&result).unwrap();
+        // Check both updatedInput and modifiedInput
         assert_eq!(
             v["hookSpecificOutput"]["updatedInput"]["command"],
+            "rtk git add . && rtk cargo test"
+        );
+        assert_eq!(
+            v["hookSpecificOutput"]["modifiedInput"]["command"],
             "rtk git add . && rtk cargo test"
         );
     }
@@ -1053,8 +1075,11 @@ mod tests {
 
         assert_eq!(hook["hookEventName"], "PreToolUse");
         assert_eq!(hook["permissionDecisionReason"], "RTK auto-rewrite");
+        // Check both updatedInput (for CodeBuddy Code) and modifiedInput (for CodeBuddy IDE)
         assert!(hook["updatedInput"].is_object());
         assert!(hook["updatedInput"]["command"].is_string());
+        assert!(hook["modifiedInput"].is_object());
+        assert!(hook["modifiedInput"]["command"].is_string());
     }
 
     // --- Audit logging ---
